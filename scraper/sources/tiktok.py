@@ -24,15 +24,22 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
+        "Chrome/134.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Origin": "https://ads.tiktok.com",
     "Referer": (
         "https://ads.tiktok.com/business/creativecenter/"
         "inspiration/popular/hashtag/pc/en"
     ),
+    "sec-ch-ua": '"Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
 }
 
 # Keyword → category mapping
@@ -78,7 +85,30 @@ def get_trending_hashtags(
         "sort_by":      "popular",
     }
     data = _fetch(url, params)
-    raw = data.get("data", {}).get("list", [])
+
+    # Check TikTok's internal response code
+    api_code = data.get("code", -1)
+    if api_code not in (0, 200):
+        logger.warning(
+            f"TikTok hashtag API returned code {api_code}: {data.get('msg', '')} "
+            f"| raw keys: {list(data.keys())}"
+        )
+
+    # TikTok has used both "list" and "hashtag_list" at different times
+    data_obj = data.get("data") or {}
+    raw = (
+        data_obj.get("list")
+        or data_obj.get("hashtag_list")
+        or data_obj.get("hashtags")
+        or []
+    )
+
+    if not raw:
+        # Log a sample of the response to help diagnose future changes
+        logger.warning(
+            f"TikTok hashtags: empty result. data keys={list(data_obj.keys())} "
+            f"top-level keys={list(data.keys())}"
+        )
 
     results = []
     for item in raw:
@@ -87,6 +117,9 @@ def get_trending_hashtags(
         views     = item.get("video_views", 0) or 0
         rank      = item.get("rank", 99)
         raw_score = float(item.get("trend", 50) or 50)
+
+        if not name:
+            continue
 
         results.append({
             "trend_name":   f"#{name}",
@@ -115,16 +148,46 @@ def get_trending_sounds(
     limit: int = 20,
     country: str = "US",
 ) -> list[dict[str, Any]]:
-    """Fetch trending music/sounds from TikTok Creative Center."""
-    url = f"{CREATIVE_CENTER_BASE}/popular_trend/music/list"
+    """Fetch trending music/sounds from TikTok Creative Center.
+    Tries multiple URL patterns since the endpoint has changed over time.
+    """
+    # Try both known URL patterns
+    url_candidates = [
+        f"{CREATIVE_CENTER_BASE}/popular_trend/music/list",
+        f"{CREATIVE_CENTER_BASE}/popular_trend/music",
+        "https://ads.tiktok.com/creative_radar_api/v1/popular_trend/music/list",
+    ]
+
     params = {
         "period":       period,
         "page":         1,
         "limit":        limit,
         "country_code": country,
     }
-    data = _fetch(url, params)
-    raw = data.get("data", {}).get("music_list", [])
+
+    data = {}
+    for url in url_candidates:
+        data = _fetch(url, params, max_retries=2)
+        if data and data.get("code", -1) in (0, 200):
+            break
+        api_code = data.get("code", -1)
+        if api_code not in (0, 200):
+            logger.warning(f"TikTok sounds URL {url} returned code {api_code}: {data.get('msg', '')}")
+
+    # Try multiple field names for the list
+    data_obj = data.get("data") or {}
+    raw = (
+        data_obj.get("music_list")
+        or data_obj.get("list")
+        or data_obj.get("sounds")
+        or []
+    )
+
+    if not raw:
+        logger.warning(
+            f"TikTok sounds: empty result. data keys={list(data_obj.keys())} "
+            f"top-level keys={list(data.keys())}"
+        )
 
     results = []
     for item in raw:
@@ -132,6 +195,9 @@ def get_trending_sounds(
         author     = item.get("author", "Unknown") or "Unknown"
         use_count  = item.get("use_count", 0) or item.get("video_count", 0) or 0
         rank       = item.get("rank", 99)
+
+        if not music_name:
+            continue
 
         results.append({
             "trend_name":   f"{music_name} – {author}",

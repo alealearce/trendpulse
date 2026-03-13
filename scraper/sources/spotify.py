@@ -1,12 +1,15 @@
 """
 sources/spotify.py
 
-Pulls songs from Spotify's Viral 50 and New Music Friday playlists.
+Pulls trending songs from Spotify chart playlists.
 
-Spotify is the single best LEADING indicator for TikTok sounds —
+Spotify is a strong LEADING indicator for TikTok sounds —
 a song typically goes viral on Spotify's charts 24-72 hours before
-it explodes on TikTok. Songs in the top 10 of the Viral 50 that
-have under 50K TikTok uses are the prime early signals.
+it explodes on TikTok. Top songs on hot playlists with high popularity
+scores are the prime early signals.
+
+Note: Viral 50 playlists were discontinued in 2023 and now require
+user authentication. We use currently accessible chart playlists instead.
 
 Requires: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET env vars
 Free credentials at: developer.spotify.com → Create App
@@ -18,19 +21,20 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Playlist IDs — Spotify maintains these official charts
-VIRAL_PLAYLISTS = {
-    "viral_global": "37i9dQZEVXbMDoHDwVN2tF",   # Viral 50 - Global
-    "viral_us":     "37i9dQZEVXbKuITLyxMdLs",   # Viral 50 - USA
-    "viral_ca":     "37i9dQZEVXbKLMSCGPuX8Up",   # Viral 50 - Canada
-    "new_friday":   "37i9dQZF1DX4JAvHpjipBk",    # New Music Friday
+# Playlist IDs — publicly accessible Spotify editorial playlists
+TARGET_PLAYLISTS = {
+    "top_hits_global": "37i9dQZF1DXcBWIGoYBM5M",  # Today's Top Hits
+    "hot_hits_usa":    "37i9dQZF1DXcF6B6QPhFDv",  # Hot Hits USA
+    "new_friday":      "37i9dQZF1DX4JAvHpjipBk",  # New Music Friday
+    "pop_rising":      "37i9dQZF1DWUa8ZRTfalHk",  # Pop Rising
 }
 
 
 def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
     """
-    Return songs from Spotify Viral playlists, normalized as trend dicts.
-    Pulls from Global + US + Canada charts, deduplicating by track ID.
+    Return songs from Spotify chart playlists, normalized as trend dicts.
+    Pulls from multiple playlists, deduplicating by track ID.
+    Falls back to search if playlists yield too few results.
     """
     sp = _client()
     if not sp:
@@ -39,13 +43,7 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
     results: list[dict[str, Any]] = []
 
-    targets = [
-        ("viral_global", VIRAL_PLAYLISTS["viral_global"]),
-        ("viral_us",     VIRAL_PLAYLISTS["viral_us"]),
-        ("viral_ca",     VIRAL_PLAYLISTS["viral_ca"]),
-    ]
-
-    for playlist_key, playlist_id in targets:
+    for playlist_key, playlist_id in TARGET_PLAYLISTS.items():
         try:
             data = sp.playlist_tracks(
                 playlist_id,
@@ -68,7 +66,7 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
                 artist     = (track.get("artists") or [{}])[0].get("name", "Unknown")
                 popularity = track.get("popularity", 50) or 50
 
-                # Songs ranked 1-10 on viral charts = strongest signal
+                # Songs ranked 1-10 on hot playlists = strongest signal
                 rank_bonus = max(0, (limit - rank) / limit * 35)
 
                 results.append({
@@ -94,7 +92,55 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
         except Exception as exc:
             logger.warning(f"Spotify playlist {playlist_key} failed: {exc}")
 
-    logger.info(f"Spotify: {len(results)} viral sounds")
+    # Search fallback: if playlists yielded too few results, search for
+    # popular recent tracks directly
+    if len(results) < 10:
+        logger.info("Spotify playlists yielded few results, trying search fallback")
+        try:
+            search_data = sp.search(
+                q="year:2025-2026",
+                type="track",
+                market="US",
+                limit=50,
+            )
+            tracks = (search_data.get("tracks") or {}).get("items", [])
+            # Sort by popularity descending
+            tracks.sort(key=lambda t: t.get("popularity", 0), reverse=True)
+
+            for rank, track in enumerate(tracks[:limit], start=1):
+                track_id = track.get("id")
+                if not track_id or track_id in seen_ids:
+                    continue
+                seen_ids.add(track_id)
+
+                name       = track.get("name", "")
+                artist     = (track.get("artists") or [{}])[0].get("name", "Unknown")
+                popularity = track.get("popularity", 50) or 50
+
+                results.append({
+                    "trend_name":   f"{name} – {artist}",
+                    "trend_type":   "sound",
+                    "category":     "general",
+                    "source":       "spotify",
+                    "raw_score":    popularity * 0.5,
+                    "velocity_24h": None,
+                    "total_uses":   0,
+                    "views":        0,
+                    "rank":         rank,
+                    "example_url":  track.get("external_urls", {}).get("spotify"),
+                    "extra": {
+                        "track_id":    track_id,
+                        "artist":      artist,
+                        "popularity":  popularity,
+                        "playlist":    "search_fallback",
+                        "preview_url": track.get("preview_url"),
+                    },
+                })
+
+        except Exception as exc:
+            logger.warning(f"Spotify search fallback failed: {exc}")
+
+    logger.info(f"Spotify: {len(results)} trending sounds")
     return results
 
 
