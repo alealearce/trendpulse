@@ -8,8 +8,11 @@ Used in two ways:
   1. get_trending_topics()   — today's top trending searches
   2. check_keyword_velocity() — validate TikTok trends with search lift
 
-Primary method: Google Trends daily RSS feed (reliable, no library needed)
-Fallback: pytrends realtime / legacy endpoints
+Primary method: Google Trends RSS feed (reliable, no library needed)
+  URL: https://trends.google.com/trending/rss?geo=US
+  (old URL /trends/trendingsearches/daily/rss returns 404 as of 2025)
+
+Fallback: pytrends
 
 Free, no API key required.
 """
@@ -28,6 +31,9 @@ PRODUCT_KW = ["buy", "sale", "deal", "review", "amazon", "dupes", "haul"]
 BEAUTY_KW  = ["makeup", "skincare", "beauty", "hair", "nails"]
 FITNESS_KW = ["workout", "gym", "yoga", "fitness", "exercise"]
 
+# Namespace used in new Google Trends RSS format
+_HT_NS = "https://trends.google.com/trending/rss"
+
 _RSS_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -43,10 +49,10 @@ def get_trending_topics(geo: str = "US") -> list[dict[str, Any]]:
     Pull today's top trending searches from Google.
     Returns them normalized as trend dicts.
 
-    Primary: Google Trends daily RSS feed
-    Fallback: pytrends realtime / legacy endpoints
+    Primary: Google Trends RSS feed (new URL, 2025+)
+    Fallback: pytrends
     """
-    # ── Primary: RSS feed ─────────────────────────────────────────────────────
+    # ── Primary: new RSS endpoint ─────────────────────────────────────────────
     results = _fetch_rss(geo)
     if results:
         logger.info(f"Google Trends RSS: {len(results)} trending topics")
@@ -66,7 +72,9 @@ def get_trending_topics(geo: str = "US") -> list[dict[str, Any]]:
             df     = pytrends.trending_searches(pn=pn)
             topics = df[0].tolist()[:20]
 
-        return _topics_to_trends(topics, geo, source="pytrends")
+        results = _topics_to_trends(topics, geo, source="pytrends")
+        logger.info(f"Google Trends pytrends: {len(results)} topics")
+        return results
 
     except Exception as exc:
         logger.warning(f"Google Trends pytrends fallback failed: {exc}")
@@ -122,25 +130,31 @@ def check_keyword_velocity(
 
 def _fetch_rss(geo: str = "US") -> list[dict[str, Any]]:
     """
-    Fetch Google Trends daily trending searches via RSS.
-    Returns [] on any failure so the caller can fall back.
+    Fetch Google Trends daily trending searches via RSS (new endpoint, 2025+).
+    Returns [] on failure so the caller can fall back.
     """
-    url = f"https://trends.google.com/trends/trendingsearches/daily/rss?geo={geo}"
+    url = f"https://trends.google.com/trending/rss?geo={geo}"
     try:
         resp = httpx.get(url, headers=_RSS_HEADERS, timeout=15, follow_redirects=True)
         resp.raise_for_status()
+
         root  = ET.fromstring(resp.text)
         items = root.findall(".//item")
         if not items:
-            logger.warning("Google Trends RSS: no <item> elements found")
+            logger.warning("Google Trends RSS: no <item> elements in feed")
             return []
 
-        topics = [item.findtext("title", "").strip() for item in items[:20]]
-        topics = [t for t in topics if t]
+        topics = []
+        for item in items[:20]:
+            # New format: title is a direct text element
+            title = item.findtext("title", "").strip()
+            if title:
+                topics.append(title)
+
         return _topics_to_trends(topics, geo, source="rss")
 
     except ET.ParseError as exc:
-        logger.warning(f"Google Trends RSS parse error: {exc}")
+        logger.warning(f"Google Trends RSS XML parse error: {exc}")
         return []
     except Exception as exc:
         logger.warning(f"Google Trends RSS failed: {exc}")
@@ -203,5 +217,5 @@ def _pytrends_client():
         logger.warning("pytrends not installed — skipping Google Trends fallback")
         return None
     except Exception as exc:
-        logger.warning(f"Google Trends pytrends client init failed: {exc}")
+        logger.warning(f"Google Trends pytrends init failed: {exc}")
         return None
