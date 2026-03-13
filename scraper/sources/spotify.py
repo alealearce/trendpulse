@@ -4,9 +4,14 @@ sources/spotify.py
 Pulls trending songs from Spotify using endpoints that work with
 Client Credentials (no user auth required).
 
-Note: As of Nov 2023, Spotify restricted GET /v1/playlists/{id}/tracks
-to require user OAuth even for public playlists. We use search +
-recommendations instead, which still work with Client Credentials.
+API changes to work around:
+- Nov 2023: GET /v1/playlists/{id}/tracks requires user OAuth
+- Late 2024: GET /v1/recommendations deprecated (404)
+- 2025+: search with field filters (year:, genre:) returns 400
+
+We now use:
+  1. browse/new-releases → album_tracks → tracks (for popularity scores)
+  2. Simple search queries (no field filters, limit ≤ 20) as fallback
 
 Requires: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET env vars
 Free credentials at: developer.spotify.com → Create App
@@ -18,14 +23,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Popular seed genres for recommendations endpoint
-SEED_GENRES = ["pop", "hip-hop", "dance", "r-n-b", "latin"]
-
 
 def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
     """
     Return trending songs from Spotify, normalized as trend dicts.
-    Uses search + recommendations (both work with Client Credentials).
+    Uses new_releases + simple search (both work with Client Credentials).
     """
     sp = _client()
     if not sp:
@@ -34,109 +36,120 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
     results: list[dict[str, Any]] = []
 
-    # ── Strategy 1: Search for popular tracks released this year ─────────────
-    for query in ["year:2026", "year:2025", "genre:pop"]:
-        if len(results) >= limit:
-            break
-        try:
-            resp = sp.search(
-                q=query,
-                type="track",
-                market="US",
-                limit=50,
-            )
-            tracks = (resp.get("tracks") or {}).get("items") or []
-            # Sort by popularity descending
-            tracks.sort(key=lambda t: (t or {}).get("popularity", 0), reverse=True)
-            logger.info(f"Spotify search '{query}': {len(tracks)} candidates")
+    # ── Strategy 1: New releases → album tracks → full track objects ─────────
+    try:
+        nr = sp.new_releases(country="US", limit=20)
+        albums = (nr.get("albums") or {}).get("items") or []
+        logger.info(f"Spotify new releases: {len(albums)} albums")
 
-            for rank, track in enumerate(tracks[:limit], start=1):
-                if not track:
-                    continue
-                track_id = track.get("id")
-                if not track_id or track_id in seen_ids:
-                    continue
-                seen_ids.add(track_id)
+        # Collect track IDs from each album (up to 3 tracks per album)
+        track_ids: list[str] = []
+        for album in albums:
+            if not album:
+                continue
+            album_id = album.get("id")
+            if not album_id:
+                continue
+            try:
+                at = sp.album_tracks(album_id, market="US", limit=3)
+                for t in (at or {}).get("items") or []:
+                    if t and t.get("id") and t["id"] not in seen_ids:
+                        track_ids.append(t["id"])
+                        seen_ids.add(t["id"])
+            except Exception as exc:
+                logger.debug(f"album_tracks({album_id}) failed: {exc}")
 
-                name       = track.get("name", "")
-                artists    = track.get("artists") or [{}]
-                artist     = artists[0].get("name", "Unknown")
-                popularity = track.get("popularity") or 50
-                ext_urls   = track.get("external_urls") or {}
+        # Fetch full track objects with popularity (max 50 per call)
+        for i in range(0, min(len(track_ids), 100), 50):
+            chunk = track_ids[i : i + 50]
+            if not chunk:
+                continue
+            try:
+                resp = sp.tracks(chunk, market="US")
+                tracks = [t for t in (resp or {}).get("tracks") or [] if t]
+                tracks.sort(key=lambda t: t.get("popularity", 0), reverse=True)
+                for track in tracks:
+                    tid = track.get("id")
+                    if not tid:
+                        continue
+                    name       = track.get("name", "")
+                    artists    = track.get("artists") or [{}]
+                    artist     = artists[0].get("name", "Unknown")
+                    popularity = track.get("popularity") or 50
+                    ext_urls   = track.get("external_urls") or {}
+                    results.append({
+                        "trend_name":   f"{name} – {artist}",
+                        "trend_type":   "sound",
+                        "category":     "general",
+                        "source":       "spotify",
+                        "raw_score":    popularity * 0.5,
+                        "velocity_24h": None,
+                        "total_uses":   0,
+                        "views":        0,
+                        "rank":         len(results) + 1,
+                        "example_url":  ext_urls.get("spotify"),
+                        "extra": {
+                            "track_id":    tid,
+                            "artist":      artist,
+                            "popularity":  popularity,
+                            "playlist":    "new_releases",
+                            "preview_url": track.get("preview_url"),
+                        },
+                    })
+            except Exception as exc:
+                logger.warning(f"Spotify tracks() call failed: {exc}")
 
-                results.append({
-                    "trend_name":   f"{name} – {artist}",
-                    "trend_type":   "sound",
-                    "category":     "general",
-                    "source":       "spotify",
-                    "raw_score":    popularity * 0.5,
-                    "velocity_24h": None,
-                    "total_uses":   0,
-                    "views":        0,
-                    "rank":         rank,
-                    "example_url":  ext_urls.get("spotify"),
-                    "extra": {
-                        "track_id":    track_id,
-                        "artist":      artist,
-                        "popularity":  popularity,
-                        "playlist":    f"search:{query}",
-                        "preview_url": track.get("preview_url"),
-                    },
-                })
+        logger.info(f"Spotify new_releases strategy: {len(results)} tracks")
 
-        except Exception as exc:
-            logger.warning(f"Spotify search '{query}' failed: {exc}")
+    except Exception as exc:
+        logger.warning(f"Spotify new_releases failed: {exc}")
 
-    # ── Strategy 2: Recommendations if search gave too few results ────────────
-    if len(results) < 10:
-        logger.info(f"Search gave {len(results)} tracks — trying recommendations")
-        try:
-            rec = sp.recommendations(
-                seed_genres=SEED_GENRES[:5],
-                limit=50,
-                market="US",
-                min_popularity=60,
-            )
-            tracks = (rec or {}).get("tracks") or []
-            tracks.sort(key=lambda t: (t or {}).get("popularity", 0), reverse=True)
-            logger.info(f"Spotify recommendations: {len(tracks)} candidates")
+    # ── Strategy 2: Simple search queries as fallback ─────────────────────────
+    if len(results) < limit:
+        for query in ["pop", "hip hop", "top hits"]:
+            if len(results) >= limit:
+                break
+            try:
+                resp = sp.search(q=query, type="track", limit=20)
+                tracks = (resp.get("tracks") or {}).get("items") or []
+                tracks.sort(key=lambda t: (t or {}).get("popularity", 0), reverse=True)
+                logger.info(f"Spotify search '{query}': {len(tracks)} candidates")
 
-            for rank, track in enumerate(tracks[:limit], start=1):
-                if not track:
-                    continue
-                track_id = track.get("id")
-                if not track_id or track_id in seen_ids:
-                    continue
-                seen_ids.add(track_id)
+                for track in tracks:
+                    if not track:
+                        continue
+                    track_id = track.get("id")
+                    if not track_id or track_id in seen_ids:
+                        continue
+                    seen_ids.add(track_id)
 
-                name       = track.get("name", "")
-                artists    = track.get("artists") or [{}]
-                artist     = artists[0].get("name", "Unknown")
-                popularity = track.get("popularity") or 50
-                ext_urls   = track.get("external_urls") or {}
+                    name       = track.get("name", "")
+                    artists    = track.get("artists") or [{}]
+                    artist     = artists[0].get("name", "Unknown")
+                    popularity = track.get("popularity") or 50
+                    ext_urls   = track.get("external_urls") or {}
 
-                results.append({
-                    "trend_name":   f"{name} – {artist}",
-                    "trend_type":   "sound",
-                    "category":     "general",
-                    "source":       "spotify",
-                    "raw_score":    popularity * 0.5,
-                    "velocity_24h": None,
-                    "total_uses":   0,
-                    "views":        0,
-                    "rank":         rank,
-                    "example_url":  ext_urls.get("spotify"),
-                    "extra": {
-                        "track_id":    track_id,
-                        "artist":      artist,
-                        "popularity":  popularity,
-                        "playlist":    "recommendations",
-                        "preview_url": track.get("preview_url"),
-                    },
-                })
-
-        except Exception as exc:
-            logger.warning(f"Spotify recommendations failed: {exc}")
+                    results.append({
+                        "trend_name":   f"{name} – {artist}",
+                        "trend_type":   "sound",
+                        "category":     "general",
+                        "source":       "spotify",
+                        "raw_score":    popularity * 0.5,
+                        "velocity_24h": None,
+                        "total_uses":   0,
+                        "views":        0,
+                        "rank":         len(results) + 1,
+                        "example_url":  ext_urls.get("spotify"),
+                        "extra": {
+                            "track_id":    track_id,
+                            "artist":      artist,
+                            "popularity":  popularity,
+                            "playlist":    f"search:{query}",
+                            "preview_url": track.get("preview_url"),
+                        },
+                    })
+            except Exception as exc:
+                logger.warning(f"Spotify search '{query}' failed: {exc}")
 
     logger.info(f"Spotify: {len(results)} trending sounds")
     return results
