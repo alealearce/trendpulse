@@ -1,11 +1,13 @@
 # HTTP client — faster and cleaner than requests
 httpx>=0.27.0
 
-# Spotify charts (Viral 50)
+# Spotify charts
 spotipy>=2.23.0
 
-# Google Trends
+# Google Trends — pytrends uses urllib3 Retry(method_whitelist=...) which
+# was renamed to allowed_methods in urllib3 2.0. Pin to <2 to avoid crash.
 pytrends>=4.9.2
+urllib3<2
 
 # Reddit API
 praw>=7.7.1
@@ -13,11 +15,11 @@ praw>=7.7.1
 # Supabase
 supabase>=2.4.0
 
-# Email (Resend) — used by email sender (Day 3)
+# Email (Resend)
 resend>=0.7.0
 
 # Env vars
 python-dotenv>=1.0.0
 
-# Anthropic (for why_its_early blurbs — optional, added in Day 3)
+# Anthropic (for why_its_early blurbs — optional)
 anthropic>=0.25.0
