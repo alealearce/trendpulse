@@ -34,8 +34,15 @@ def get_trending_topics(geo: str = "US") -> list[dict[str, Any]]:
 
     try:
         pn = "united_states" if geo == "US" else "canada"
-        df = pytrends.trending_searches(pn=pn)
-        topics: list[str] = df[0].tolist()[:20]
+        # trending_searches() endpoint is deprecated/broken in 2025+.
+        # realtime_trending_searches() hits a different, working endpoint.
+        try:
+            df = pytrends.realtime_trending_searches(pn=geo)
+            topics: list[str] = df["title"].tolist()[:20]
+        except Exception:
+            # Last-resort fallback to legacy endpoint
+            df = pytrends.trending_searches(pn=pn)
+            topics = df[0].tolist()[:20]
 
         results = []
         for rank, term in enumerate(topics, start=1):

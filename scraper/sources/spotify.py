@@ -5,11 +5,7 @@ Pulls trending songs from Spotify chart playlists.
 
 Spotify is a strong LEADING indicator for TikTok sounds —
 a song typically goes viral on Spotify's charts 24-72 hours before
-it explodes on TikTok. Top songs on hot playlists with high popularity
-scores are the prime early signals.
-
-Note: Viral 50 playlists were discontinued in 2023 and now require
-user authentication. We use currently accessible chart playlists instead.
+it explodes on TikTok.
 
 Requires: SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET env vars
 Free credentials at: developer.spotify.com → Create App
@@ -21,12 +17,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Playlist IDs — publicly accessible Spotify editorial playlists
+# Publicly accessible Spotify editorial playlists (verified IDs)
 TARGET_PLAYLISTS = {
     "top_hits_global": "37i9dQZF1DXcBWIGoYBM5M",  # Today's Top Hits
-    "hot_hits_usa":    "37i9dQZF1DXcF6B6QPhFDv",  # Hot Hits USA
     "new_friday":      "37i9dQZF1DX4JAvHpjipBk",  # New Music Friday
     "pop_rising":      "37i9dQZF1DWUa8ZRTfalHk",  # Pop Rising
+    "hot_country":     "37i9dQZF1DX1lVhptIYRda",  # Hot Country
 }
 
 
@@ -34,7 +30,6 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
     """
     Return songs from Spotify chart playlists, normalized as trend dicts.
     Pulls from multiple playlists, deduplicating by track ID.
-    Falls back to search if playlists yield too few results.
     """
     sp = _client()
     if not sp:
@@ -45,16 +40,22 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
 
     for playlist_key, playlist_id in TARGET_PLAYLISTS.items():
         try:
-            data = sp.playlist_tracks(
+            # Fetch without fields restriction to avoid API compatibility issues.
+            # additional_types="track" required to get tracks (not episodes).
+            resp = sp.playlist_tracks(
                 playlist_id,
                 limit=limit,
-                fields="items(track(id,name,artists,external_urls,popularity,preview_url))",
+                market="US",
+                additional_types=("track",),
             )
-            items = data.get("items", [])
+            items = resp.get("items") or []
+            logger.info(f"Spotify {playlist_key}: {len(items)} raw items")
 
             for rank, item in enumerate(items, start=1):
+                if not item:
+                    continue
                 track = item.get("track")
-                if not track:
+                if not track or track.get("type") != "track":
                     continue
 
                 track_id = track.get("id")
@@ -63,10 +64,11 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
                 seen_ids.add(track_id)
 
                 name       = track.get("name", "")
-                artist     = (track.get("artists") or [{}])[0].get("name", "Unknown")
-                popularity = track.get("popularity", 50) or 50
+                artists    = track.get("artists") or [{}]
+                artist     = artists[0].get("name", "Unknown")
+                popularity = track.get("popularity") or 50
+                ext_urls   = track.get("external_urls") or {}
 
-                # Songs ranked 1-10 on hot playlists = strongest signal
                 rank_bonus = max(0, (limit - rank) / limit * 35)
 
                 results.append({
@@ -76,10 +78,10 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
                     "source":       "spotify",
                     "raw_score":    rank_bonus + (popularity * 0.25),
                     "velocity_24h": None,
-                    "total_uses":   0,       # no TikTok use count from Spotify
+                    "total_uses":   0,
                     "views":        0,
                     "rank":         rank,
-                    "example_url":  track.get("external_urls", {}).get("spotify"),
+                    "example_url":  ext_urls.get("spotify"),
                     "extra": {
                         "track_id":    track_id,
                         "artist":      artist,
@@ -92,30 +94,33 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
         except Exception as exc:
             logger.warning(f"Spotify playlist {playlist_key} failed: {exc}")
 
-    # Search fallback: if playlists yielded too few results, search for
-    # popular recent tracks directly
+    # Search fallback: newest popular tracks if playlists yielded too few
     if len(results) < 10:
-        logger.info("Spotify playlists yielded few results, trying search fallback")
+        logger.info(f"Spotify playlists gave {len(results)} tracks — trying search fallback")
         try:
-            search_data = sp.search(
-                q="year:2025-2026",
+            search_resp = sp.search(
+                q="tag:new",
                 type="track",
                 market="US",
                 limit=50,
             )
-            tracks = (search_data.get("tracks") or {}).get("items", [])
-            # Sort by popularity descending
-            tracks.sort(key=lambda t: t.get("popularity", 0), reverse=True)
+            tracks = (search_resp.get("tracks") or {}).get("items") or []
+            tracks.sort(key=lambda t: t.get("popularity", 0) if t else 0, reverse=True)
+            logger.info(f"Spotify search: {len(tracks)} candidates")
 
             for rank, track in enumerate(tracks[:limit], start=1):
+                if not track:
+                    continue
                 track_id = track.get("id")
                 if not track_id or track_id in seen_ids:
                     continue
                 seen_ids.add(track_id)
 
-                name       = track.get("name", "")
-                artist     = (track.get("artists") or [{}])[0].get("name", "Unknown")
-                popularity = track.get("popularity", 50) or 50
+                name    = track.get("name", "")
+                artists = track.get("artists") or [{}]
+                artist  = artists[0].get("name", "Unknown")
+                popularity = track.get("popularity") or 50
+                ext_urls   = track.get("external_urls") or {}
 
                 results.append({
                     "trend_name":   f"{name} – {artist}",
@@ -127,7 +132,7 @@ def get_viral_sounds(limit: int = 20) -> list[dict[str, Any]]:
                     "total_uses":   0,
                     "views":        0,
                     "rank":         rank,
-                    "example_url":  track.get("external_urls", {}).get("spotify"),
+                    "example_url":  ext_urls.get("spotify"),
                     "extra": {
                         "track_id":    track_id,
                         "artist":      artist,

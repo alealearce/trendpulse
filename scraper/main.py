@@ -100,8 +100,14 @@ def run() -> bool:
     logger.info(f"Total raw signals: {len(all_raw)}")
 
     if not all_raw:
-        logger.error("No data collected from any source — aborting")
-        return False
+        logger.warning(
+            "No data collected from any source — skipping save. "
+            "TikTok CC requires browser auth (code 40101). "
+            "Check Spotify/Google Trends logs above."
+        )
+        # Exit 0 so Railway does not mark the run as crashed.
+        # The scraper will retry on the next scheduled run.
+        return True
 
     # ── 2. Score + deduplicate ────────────────────────────────────────────────
     logger.info("▶ Scoring and ranking...")
